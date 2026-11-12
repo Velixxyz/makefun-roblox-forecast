@@ -1,4 +1,4 @@
-"""Roblox Up-and-Coming top-10 forecaster v2 (make.fun
+"""Roblox Up-and-Coming top-10 forecaster v4 (make.fun
 roblox-up-and-coming-forecast-01).
 
 Reads the chart history in /input (or $MAKEFUN_INPUT_DIR) and writes one
@@ -11,10 +11,11 @@ it is a pooled occupancy distribution, not a point prediction.
 Method: a three-way ensemble, blended 0.6 / 0.2 / 0.2.
 1. Monte Carlo rank diffusion (weight 0.6). Each game in the last chart
    has a rank and a shrunk recent velocity (24h window, decay 0.5;
-   velocity persists with correlation about 0.25). Each hour for 72
-   hours the rank moves by velocity plus sigma(rank) times a standard
-   normal draw, with sigma scaled by 0.6: the archive shows the raw
-   diffusion over-disperses the pooled occupancy. Sigma grows with rank
+   velocity weight 0.4: stronger persistence than the measured 0.25
+   correlation, validated on walk-forward backtests in Nov 2026).
+   Each hour for 72 hours the rank moves by velocity plus sigma(rank)
+   times a standard normal draw, with sigma scaled by 0.5: the archive
+   shows the raw diffusion over-disperses the pooled occupancy. Sigma grows with rank
    (about 0.5 ranks/sqrt-hour at the top, about 3.7 deep in the chart),
    estimated from the input history and shrunk toward priors measured
    on the public archive. No systematic drift is applied: in an
@@ -51,7 +52,7 @@ Now) and name update-tags were tested and carry no usable signal.
 
 Validated on the practice window (10 archive reads 2026-11-08..2026-11-10)
 and seven walk-forward backtests inside the 34-read history. Practice
-log score about -32.7 nats (v1: -34.3), walk-forward average about -35.1.
+log score about -32.5 nats (v3: -32.7), walk-forward average about -35.0.
 Deterministic: fixed seeds, sorted output.
 """
 import json
@@ -64,9 +65,9 @@ from datetime import datetime
 MC_PATHS = 3000
 MC_HOURS = 72
 MC_GAMES = 100
-MC_VEL_W = 0.25
+MC_VEL_W = 0.4
 MC_VEL_HALF_LIFE_H = 12.0
-MC_SIGMA_SCALE = 0.6
+MC_SIGMA_SCALE = 0.5
 MC_UNNAMED = 0.22
 MC_P_CAP = 0.8
 MC_SEED = 12345

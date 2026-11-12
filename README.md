@@ -1,9 +1,18 @@
-# Roblox Up-and-Coming Top-10 Forecaster v3
+# Roblox Up-and-Coming Top-10 Forecaster v4
 
 Entry for make.fun `roblox-up-and-coming-forecast-01`: a program that reads
 the history of Roblox's Up-and-Coming chart and forecasts its top 10, with
 a probability for each game at each place, for the 72 hours after entries
 close.
+
+v4 = v3 (three-way ensemble, same structure, aging-out fix included) with
+ONE parameter change in the Monte Carlo component: velocity weight 0.25 ->
+0.4 and sigma scale 0.6 -> 0.5. The two knobs offset each other's
+weaknesses (velocity alone regresses practice, sigma alone regresses
+walk-forward); combined they improve both. Validated at the production
+configuration (3000 paths): practice -32.53 (v3: -32.70), walk-forward
+average -35.01 (v3: -35.10), blend -33.77 (v3: -33.90). The edge survives
+an alternate RNG seed (+0.11 blend) and two further path counts.
 
 v3 = v2 (three-way ensemble, same parameters) with ONE fix: the hard
 created+28d aging-out rule in the Monte Carlo component is REMOVED.
@@ -40,9 +49,10 @@ A three-way ensemble, blended 0.6 / 0.2 / 0.2:
 
 1. **Monte Carlo rank diffusion (0.6).** Each game in the last chart has a
    rank and a shrunk recent velocity (24h window, decay 0.5; velocity
-   persists with correlation about 0.25). Each hour for 72 hours the rank
+   weight 0.4, stronger persistence than the measured 0.25 correlation,
+   validated on walk-forward backtests). Each hour for 72 hours the rank
    moves by velocity plus sigma(rank) times a standard normal draw, with
-   sigma scaled by 0.6: the archive shows raw diffusion over-disperses the
+   sigma scaled by 0.5: the archive shows raw diffusion over-disperses the
    pooled occupancy. Sigma grows with rank and is estimated from the input
    history, shrunk toward archive priors. No systematic drift is applied.
 2. **Empirical transition occupancy (0.2).** Future ranks are drawn from
@@ -70,9 +80,9 @@ update-tags were tested and carry no usable signal.
 
 ## Validation
 
-Practice window (10 archive reads 2026-11-08..2026-11-10): log score about
--32.7 nats (v1 Monte Carlo: -34.3). Seven walk-forward backtests inside
-the 34-read history average about -35.1. A 70-config sweep on 2026-11-13
+Practice window (10 archive reads 2026-11-08..2026-11-10): log score
+-32.53 nats (v3: -32.70). Seven walk-forward backtests inside
+the 34-read history average -35.01 (v3: -35.10). A 70-config sweep on 2026-11-13
 (blend weights, unnamed splits, per-place temperature, floors/caps,
 persistence blend) found the v2 configuration at a flat optimum: no variant
 beat it by more than 0.03 nats on the practice+WF blend metric, and every
