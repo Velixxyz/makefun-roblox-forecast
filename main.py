@@ -66,6 +66,7 @@ MC_PATHS = 3000
 MC_HOURS = 72
 MC_GAMES = 100
 MC_VEL_W = 0.4
+MC_GROWTH_W = 0.3
 MC_VEL_HALF_LIFE_H = 12.0
 MC_SIGMA_SCALE = 0.5
 MC_UNNAMED = 0.22
@@ -77,6 +78,7 @@ MAX_RANK = 130.0
 OCC_DRAWS = 1500
 OCC_HORIZONS = [3, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72]
 OCC_VEL_SHIFT = 0.5
+OCC_GROWTH_W = 0.5
 OCC_VEL_HALF_LIFE_H = 12.0
 OCC_TEMPERATURE = 0.6
 OCC_SEED = 12345
@@ -161,6 +163,16 @@ def load_history(input_dir):
                 rank = i + 1
             ranked.append((rank, uid))
         chart = [uid for _, uid in sorted(ranked, key=lambda p: p[0])]
+        playing = {}
+        for r in rows:
+            if isinstance(r, dict):
+                try:
+                    pu = int(r["universe_id"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                pv = r.get("playing")
+                if isinstance(pv, (int, float)) and pv is not None:
+                    playing[pu] = pv
         created = {}
         details = d.get("details") or {}
         if isinstance(details, dict):
@@ -170,7 +182,8 @@ def load_history(input_dir):
                         created[int(uid)] = _parse_time(det["created"])
                     except (ValueError, TypeError):
                         pass
-        reads.append({"at": at, "chart": chart, "created": created})
+        reads.append({"at": at, "chart": chart, "created": created,
+                      "playing": playing})
     # Time order is assumed downstream (reads[-1] is latest, _build_pools
     # breaks on h > 200). Stable: no-op on already-sorted inputs.
     reads.sort(key=lambda r: r["at"])
@@ -184,6 +197,41 @@ def load_history(input_dir):
         task = {}
     return reads, task
 
+
+# GROWTH-HELPERS-5D
+def _tod_curve(reads):
+    by_hour = {}
+    for r in reads:
+        for p in (r.get("playing") or {}).values():
+            if isinstance(p, (int, float)) and p > 0:
+                by_hour.setdefault(r["at"].hour, []).append(math.log(p))
+    if not by_hour:
+        return {}
+    med = {}
+    for h, vals in by_hour.items():
+        vals.sort()
+        med[h] = vals[len(vals) // 2]
+    mean = sum(med.values()) / len(med)
+    return {h: v - mean for h, v in med.items()}
+
+
+def _growth_24h(reads, i, u, tod):
+    t = reads[i]["at"]
+    best = None
+    for j in range(i):
+        h = (t - reads[j]["at"]).total_seconds() / 3600.0
+        if 20.0 <= h <= 28.0 and (best is None or abs(h - 24.0) < abs(best[1] - 24.0)):
+            best = (j, h)
+    if best is None:
+        return 0.0
+    p1 = (reads[i].get("playing") or {}).get(u)
+    p0 = (reads[best[0]].get("playing") or {}).get(u)
+    if not (isinstance(p1, (int, float)) and isinstance(p0, (int, float))
+            and p1 > 0 and p0 > 0):
+        return 0.0
+    g = ((math.log(p1) - tod.get(t.hour, 0.0))
+         - (math.log(p0) - tod.get(reads[best[0]]["at"].hour, 0.0)))
+    return max(-3.0, min(3.0, g))
 
 def estimate_dynamics(reads):
     """Per-hour drift and diffusion sigma by rank, estimated from
@@ -268,6 +316,9 @@ def _normalize(probs, unnamed_top, unnamed_rest, p_cap, p_floor):
     return rows
 
 
+_CHART_N = [97]  # last-chart size, set by forecast_mc; 97 = measured median
+
+
 def forecast_mc(reads):
     """Component 1: Monte Carlo rank diffusion."""
     last = reads[-1]
@@ -277,13 +328,16 @@ def forecast_mc(reads):
         created.update(r["created"])
     t0 = last["at"]
     _, sigma_fn = estimate_dynamics(reads)
+    _CHART_N[0] = len(chart)
+    tod = _tod_curve(reads)
     vel_decay = 0.5 ** (1.0 / MC_VEL_HALF_LIFE_H)
 
     games = chart[:MC_GAMES]
     init = []
     for u in games:
         r0 = chart.index(u) + 1
-        v0 = MC_VEL_W * estimate_velocity(reads, u)
+        g0 = _growth_24h(reads, len(reads) - 1, u, tod)
+        v0 = MC_VEL_W * estimate_velocity(reads, u) - MC_GROWTH_W * g0
         # NO hard aging-out: verified 2026-11-13 against the games API that
         # games with universe `created` age up to 369 days still appear on the
         # chart, and exit hazard rises smoothly with age (no 28-day cliff).
@@ -417,6 +471,8 @@ def forecast_occ(reads):
 
     games = chart[:100]
     vel = {u: estimate_velocity(reads, u) for u in games}
+    tod = _tod_curve(reads)
+    gro = {u: _growth_24h(reads, len(reads) - 1, u, tod) for u in games}
     pos_last = set(chart)
     last_seen = {}
     for i, r in enumerate(reads):
@@ -449,7 +505,7 @@ def forecast_occ(reads):
                 r0 = chart.index(u) + 1
                 rb = _bucket_of(OCC_RANK_BUCKETS, r0)
                 r = _cell_sample(rng, cells, rb, lb, lag_ids)
-                r = r + OCC_VEL_SHIFT * vel[u] * eff_h
+                r = r + OCC_VEL_SHIFT * vel[u] * eff_h - OCC_GROWTH_W * gro[u] * eff_h
                 if r < 1.0:
                     r = 1.0
                 if r > MAX_RANK and r < OCC_EXIT_RANK:
@@ -573,6 +629,34 @@ def forecast_knn(reads):
     return {"probabilities": rows, "top10": top10}
 
 
+def _tail_trim(rows, chart_n):
+    by_place = {}
+    for r in rows:
+        by_place.setdefault(r["place"], []).append(r)
+    out = []
+    for k, rs in by_place.items():
+        u_share = BLEND_UNNAMED_TOP3 if k <= 3 else BLEND_UNNAMED_REST
+        rs = list(rs)
+        for _ in range(5):
+            s = sum(r["p"] for r in rs)
+            if s <= 0 or not rs:
+                break
+            n_un = max(chart_n - len(rs), 1)
+            rate = u_share / n_un
+            keep = [r for r in rs if r["p"] >= rate]
+            if len(keep) == len(rs):
+                break
+            if not keep:
+                break
+            rs = keep
+            s2 = sum(r["p"] for r in rs)
+            scale = s / s2
+            rs = [{"universe_id": r["universe_id"], "place": k,
+                   "p": round(r["p"] * scale, 6)} for r in rs]
+        out.extend(rs)
+    return out
+
+
 def blend(fcs, weights):
     """Arithmetic blend of component forecasts, renormalized per place."""
     probs = {}
@@ -582,6 +666,7 @@ def blend(fcs, weights):
                 probs.get((r["universe_id"], r["place"]), 0.0) + w * r["p"]
     rows = _normalize(probs, BLEND_UNNAMED_TOP3, BLEND_UNNAMED_REST,
                       BLEND_P_CAP, BLEND_P_FLOOR)
+    rows = _tail_trim(rows, _CHART_N[0])
     return {"probabilities": rows, "top10": fcs[0]["top10"]}
 
 

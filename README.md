@@ -1,96 +1,32 @@
-# Roblox Up-and-Coming Top-10 Forecaster v4
+# Roblox Up-and-Coming Top-10 Forecaster v6
 
 Entry for make.fun `roblox-up-and-coming-forecast-01`: a program that reads
 the history of Roblox's Up-and-Coming chart and forecasts its top 10, with
 a probability for each game at each place, for the 72 hours after entries
-close.
+close. Deterministic, offline, standard library only.
 
-v4 = v3 (three-way ensemble, same structure, aging-out fix included) with
-ONE parameter change in the Monte Carlo component: velocity weight 0.25 ->
-0.4 and sigma scale 0.6 -> 0.5. The two knobs offset each other's
-weaknesses (velocity alone regresses practice, sigma alone regresses
-walk-forward); combined they improve both. Validated at the production
-configuration (3000 paths): practice -32.53 (v3: -32.70), walk-forward
-average -35.01 (v3: -35.10), blend -33.77 (v3: -33.90). The edge survives
-an alternate RNG seed (+0.11 blend) and two further path counts.
+Model: 3-way blend (0.6 Monte Carlo rank diffusion / 0.2 empirical
+transition occupancy / 0.2 KNN direct occupancy), as in v4, plus the
+round-3 growth signal in TWO components plus an adaptive tail trim:
 
-v3 = v2 (three-way ensemble, same parameters) with ONE fix: the hard
-created+28d aging-out rule in the Monte Carlo component is REMOVED.
+1. MC growth velocity: the Monte Carlo initial velocity is augmented by
+   the game's deseasonalized 24h log playing-count growth
+   (MC_GROWTH_W = 0.3), estimated from the input's `playing` counts after
+   removing the pooled time-of-day curve. Growth predicts 72h rank change
+   (slope -12.3 ranks per log-unit) independently of rank velocity.
+2. OCC growth shift: empirical-transition draws are shifted by the same
+   growth signal (OCC_GROWTH_W = 0.5 times the effective horizon).
+3. Adaptive tail trim: after blending, named rows below the place's
+   implied unnamed rate (unnamed share / unnamed chart games) are dropped
+   and survivors rescaled (up to 5 passes).
 
-## Why the aging-out rule was wrong
+No aging-out rule; `details.created` is ignored (output invariant to it).
 
-The rule assumed a game leaves the chart 28 days after its universe `created`
-date. Verified 2026-11-13 against the public games API (246 of 253 games in
-the history + practice reads): games with `created` age up to 369 days still
-appear on the chart (median age 22.8 days, p90 33.3 days), and exit hazard
-rises smoothly with age (0.019 at 7-14d to 0.105 at 28d+) with no cliff at
-28 days. The chart's "last 28 days" eligibility does not run on the universe
-`created` clock.
+Verification (production config, 3000 paths):
+- Seed 12345: practice -32.563, WF avg -34.220, blend -33.392 (v4: -33.773, delta +0.381).
+- Seed 777: practice -32.570, WF avg -34.204, blend -33.387 (v4: -33.790, delta +0.403).
+No walk-forward regression on either seed. Stress-tested on final-shaped
+fixtures (determinism + runtime + output validity + created/order
+invariance).
 
-The bug was invisible in all practice/walk-forward testing because the
-archive history carries no `details` (no created dates), so the rule never
-triggered. The FINAL input does carry `details` (house recorder reads call
-games/v1), so the rule would have triggered only on the final grading run.
-
-Measured damage in a created-date fixture test (same practice reads,
-`details` injected from the games API):
-
-- v1 (submitted): -34.263 without created dates, -38.597 with them (-4.33 nats, hits 7.3 -> 4.5)
-- v2: -32.705 without, -34.411 with them (-1.71 nats, hits 7.3 -> 4.5)
-- v3 (fix): -32.705 with created dates, byte-identical output to v2 on the
-  original no-details input (regression check), deterministic across runs.
-
-Exits are left to the empirical diffusion/transition behavior learned from
-history (the OCC component models exits from observed transitions).
-
-## How it works
-
-A three-way ensemble, blended 0.6 / 0.2 / 0.2:
-
-1. **Monte Carlo rank diffusion (0.6).** Each game in the last chart has a
-   rank and a shrunk recent velocity (24h window, decay 0.5; velocity
-   weight 0.4, stronger persistence than the measured 0.25 correlation,
-   validated on walk-forward backtests). Each hour for 72 hours the rank
-   moves by velocity plus sigma(rank) times a standard normal draw, with
-   sigma scaled by 0.5: the archive shows raw diffusion over-disperses the
-   pooled occupancy. Sigma grows with rank and is estimated from the input
-   history, shrunk toward archive priors. No systematic drift is applied.
-2. **Empirical transition occupancy (0.2).** Future ranks are drawn from
-   the empirical transition distribution measured on the input history
-   (start-rank bucket x lag bucket -> end rank or exit). Draw-and-sort
-   over horizons 3..72h captures true diffusion, exits, jumps and mean
-   reversion without assuming Gaussian walks. Velocity shift + temperature
-   0.6.
-3. **Direct occupancy kernel regression (0.2).** Every historical (read,
-   game) moment is a training instance with features rank, velocity and
-   lifecycle L (drawdown from the game's best rank + time since its peak);
-   its target is the game's place-occupancy vector over the following 72h.
-   Each game in the last chart averages similar moments under a Gaussian
-   kernel. Temperature 0.6.
-
-The three normalized forecasts are averaged per place and renormalized to
-leave 0.35 of places 1-3 unnamed and 0.15 of places 4-10 unnamed: the top
-places need more insurance for games that enter during the window and
-rocket into the top 10, while lower places want sharper named mass.
-
-Player counts are deliberately ignored: on the archive, log playing growth
-is uncorrelated with rank moves (correlation -0.02), because the chart is
-computed from growth, not live counts. Cross-chart membership and name
-update-tags were tested and carry no usable signal.
-
-## Validation
-
-Practice window (10 archive reads 2026-11-08..2026-11-10): log score
--32.53 nats (v3: -32.70). Seven walk-forward backtests inside
-the 34-read history average -35.01 (v3: -35.10). A 70-config sweep on 2026-11-13
-(blend weights, unnamed splits, per-place temperature, floors/caps,
-persistence blend) found the v2 configuration at a flat optimum: no variant
-beat it by more than 0.03 nats on the practice+WF blend metric, and every
-sharpening variant gained on practice but lost more on walk-forward.
-Ideas tested and rejected on walk-forward evidence: mean reversion to a
-historical anchor, last-pair velocity, lifecycle peak drift, per-game sigma,
-temperature below 0.5, persistence blending, per-place temperature, and a
-standalone kernel-regression forecaster.
-
-Deterministic: fixed seeds, sorted output. Standard library only, no
-network, one run takes well under the 300s limit.
+Frozen by round-3 subagent session e0bfafde-5ffe-4a5b-ba91-4fe85b75d9de.
